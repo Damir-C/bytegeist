@@ -48,7 +48,7 @@ const CFG = {
   OUTLINE_DILATE_RADIUS: 6,
 
   // -- static map image, bottom canvas (needs rebuildMap() after changing) --
-  IMG_ALPHA_BODY: 0.8,              // opacity of solid body-bucket map pixels
+  IMG_ALPHA_BODY: 0.92,             // opacity of solid body-bucket map pixels
   IMG_ALPHA_HALO: 0.16,             // opacity of dim halo/edge-bucket map pixels
 
   // -- sampling (live) --
@@ -96,6 +96,13 @@ const CFG = {
   COLOR_OUTLINE:   [255, 255, 255],  // silhouette-crossing digits, forced regardless of region
 
   MAX_DPR: 2,            // devicePixelRatio cap (applied on next resize)
+
+  // -- figure layout (applied on next resize; call window.resize() to force it) --
+  FIGURE_SCALE: 1.0,     // multiplies the computed letterbox scale — >1 makes the figure bigger than
+                          // the auto-fit margin allows, which can exceed/clip the viewport on purpose
+  FIGURE_MARGIN: 0.05,   // fraction of the viewport kept clear on each side when auto-fitting the letterbox
+  FIGURE_ANCHOR_Y: 0.5,  // where the figure's vertical centre sits, as a fraction of viewport height
+                          // (0 = top, 1 = bottom) — lower values move the figure up
 };
 window.CFG = CFG;
 
@@ -142,15 +149,18 @@ resize();
 
 // ── layout ────────────────────────────────────────────────────────────────
 function computeLayout() {
-  // Letterbox: fit the full map inside the viewport with a 5% margin on each side.
-  const margin = 0.05;
+  // Letterbox: fit the full map inside the viewport with FIGURE_MARGIN
+  // clear on each side, then FIGURE_SCALE stretches/shrinks that fit, and
+  // FIGURE_ANCHOR_Y places the figure's vertical centre as a fraction of
+  // viewport height instead of always mid-screen.
+  const margin = CFG.FIGURE_MARGIN;
   const availW = W * (1 - 2 * margin);
   const availH = H * (1 - 2 * margin);
-  const scale  = Math.min(availW / mapW, availH / mapH);
+  const scale  = Math.min(availW / mapW, availH / mapH) * CFG.FIGURE_SCALE;
   mW = mapW * scale;
   mH = mapH * scale;
   mX = (W - mW) / 2;
-  mY = (H - mH) / 2;
+  mY = H * CFG.FIGURE_ANCHOR_Y - mH / 2;
 }
 
 // Draw the static, alpha-adjusted map once onto the bottom canvas.
@@ -590,12 +600,14 @@ function drawDigits() {
 
   for (const d of digits) {
     const s = sample(d.x, d.y);
-    if (s === -1) continue;
+    const offMap = s === -1;
 
-    const type       = s & 0b11;
-    const isBody     = (s >> 2) & 1;
-    const isOutline  = (s >> 3) & 1;
-    const isHeadHand = (s >> 4) & 1;
+    // Outside the letterboxed map rect entirely (e.g. above/below the
+    // figure on a tall screen) — still background rain, not empty space.
+    const type       = offMap ? TYPE_BLACK : (s & 0b11);
+    const isBody     = offMap ? 0 : (s >> 2) & 1;
+    const isOutline  = offMap ? 0 : (s >> 3) & 1;
+    const isHeadHand = offMap ? 0 : (s >> 4) & 1;
 
     // thin the rain over the head/hand zone
     if (isHeadHand && Math.random() > CFG.HEAD_HAND_DENSITY) continue;
