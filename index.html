@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Bytegeist</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:#000;overflow:hidden}
+#mapCanvas,#rainCanvas{position:fixed;inset:0;display:block}
+#rainCanvas{pointer-events:none}
+</style>
+</head>
+<body>
+<canvas id="mapCanvas"></canvas>
+<canvas id="rainCanvas"></canvas>
+<script src="map.js"></script>
+<script>
+// ── config ──────────────────────────────────────────────────────────────
+// Every tunable lives here and is read as CFG.X at the point of use, never
+// copied into a local at startup — so most of these can be changed live
+// from the console with no reload, e.g. `CFG.FADE = 0.2`.
+//
+// Exception: the map-CLASSIFICATION constants (BLACK_LUM_THRESHOLD,
+// COAT_SAT_THRESHOLD, BODY_BRIGHTNESS_THRESHOLD, HEAD_HAND_HEIGHT_FRACTION,
+// IMG_ALPHA_BODY, IMG_ALPHA_HALO, OUTLINE_DILATE_RADIUS) are baked once into
+// per-pixel lookup tables for performance — changing one takes effect after
+// calling `rebuildMap()` (also exposed on window), not on the next frame.
+const CFG = {
+  // -- map classification (needs rebuildMap() after changing) --
+  BLACK_LUM_THRESHOLD: 14,          // max(r,g,b) below this = empty space
+  COAT_SAT_THRESHOLD: 0.28,         // saturation below this, on a non-black px = coat rather than green
+  BODY_BRIGHTNESS_THRESHOLD: 0.45,  // brightness (0-1) at/above this = "body" bucket, below = "halo"
+  HEAD_HAND_HEIGHT_FRACTION: 0.35,  // top fraction of the green pixels' vertical span counted as head/hand
+  // The source artwork is made of individually separated digit glyphs with
+  // black gaps between them, so almost every non-black pixel has a black
+  // neighbour — a naive "black neighbour = outline" test flags nearly the
+  // whole figure, not its silhouette. OUTLINE_DILATE_RADIUS is the map-px
+  // radius used to close those inter-glyph gaps (dilate the non-black mask,
+  // keep only its largest connected blob, take the boundary against true
+  // exterior background — see computeOutline()) before tracing an edge.
+  // Needs to bridge the glyph gaps (few px) without being so large it also
+  // pads the true outer silhouette outward. Does NOT need to bridge large
+  // intentional dark regions (e.g. the coat's open front) — those become
+  // interior holes and are correctly excluded from the traced edge either way.
+  OUTLINE_DILATE_RADIUS: 6,
+
+  // -- static map image, bottom canvas (needs rebuildMap() after changing) --
+  IMG_ALPHA_BODY: 0.8,              // opacity of solid body-bucket map pixels
+  IMG_ALPHA_HALO: 0.16,             // opacity of dim halo/edge-bucket map pixels
+
+  // -- sampling (live) --
+  // Map-px half-width of the patch a digit's sample point averages over
+  // (0 = old single nearest-pixel point sample). Painted artwork isn't a
+  // solid fill — folds, shading and antialiasing leave 1px-wide dark dips —
+  // and a digit's x never changes, so a fixed pixel column landing on one
+  // of those dips stayed dark for its whole lifetime regardless of density/
+  // size/threshold. Confirmed via debugColumns() against the real map:
+  // patch-averaging fixes it, re-randomising x on recycle doesn't (see
+  // conversation). Keep well under half a glyph's screen size or the
+  // silhouette starts to blur.
+  SAMPLE_PATCH_RADIUS: 5,
+
+  // -- rain (live) --
+  OUTLINE_ENABLED: false, // force outline-crossing digits to COLOR_OUTLINE. Off by default —
+                           // see OUTLINE_DILATE_RADIUS above for why the mask needed rebuilding first.
+  BG_ALPHA: 0.2,         // digit alpha while sampling black — background rain, must read clearly
+  FIGURE_ALPHA: 0.7,     // digit alpha the instant it samples any non-black pixel — snaps here, no ramp
+  FADE: 0.14,            // per-frame trail fade (destination-out alpha on the rain canvas). lower = longer tails
+  GLYPH_SIZE: 11,        // uniform glyph size in CSS px — one size, no per-region variance
+  SPEED_MIN: 1.2,        // uniform fall speed range in CSS px/frame — one range, no per-region multiplier
+  SPEED_MAX: 2.8,
+  STREAM_LEN_MIN: 6,     // digits-per-column-stream range (structural). Sets the jitter spread around
+  STREAM_LEN_MAX: 24,    // each column's computed share of the total, and is used directly as-is
+                          // in the rare fallback where whole columns get culled — see initDigits().
+
+  // -- density (structural — applied on next initDigits/resize) --
+  TARGET_FIGURE_GLYPHS: 120,  // average glyphs expected to be sitting on the (non-black) figure at once
+  HEAD_HAND_DENSITY: 0.25,    // fraction of normal draw rate kept over the head/hand zone (thinning)
+  // Density is normally controlled per-column (stream length + spacing),
+  // never by deleting whole columns — random independent per-column culling
+  // produced long runs of consecutive empty columns purely by chance (dead
+  // vertical strips with nothing falling in them at all; confirmed via
+  // debugColumns()). Column culling only kicks in as a fallback when the
+  // target is so sparse that even one digit per column would overshoot it,
+  // and even then this caps how many consecutive columns it may drop.
+  MAX_CONSECUTIVE_CULLED_COLUMNS: 1,
+
+  // -- colour (live) --
+  COLOR_BG:        [70, 190, 90],    // background (black-sampling) rain
+  COLOR_GREEN:     [80, 235, 100],   // body/skin region
+  COLOR_COAT_BODY: [225, 235, 250],  // coat, body bucket — near white
+  COLOR_COAT_HALO: [120, 165, 220],  // coat, halo bucket — falls off toward blue
+  COLOR_OUTLINE:   [255, 255, 255],  // silhouette-crossing digits, forced regardless of region
+
+  MAX_DPR: 2,            // devicePixelRatio cap (applied on next resize)
+};
+window.CFG = CFG;
+
+// ── canvases ────────────────────────────────────────────────────────────
+// Bottom canvas: the map image, drawn once per layout, never redrawn per frame.
+// Top canvas: transparent, holds only the rain + its trailing fade.
+const mapCanvas  = document.getElementById('mapCanvas');
+const rainCanvas = document.getElementById('rainCanvas');
+const mapCtx  = mapCanvas.getContext('2d');
+const rainCtx = rainCanvas.getContext('2d');
+
+// offscreen analysis buffer for the source map (never drawn to screen)
+const analysisCanvas = document.createElement('canvas');
+const analysisCtx    = analysisCanvas.getContext('2d');
+// offscreen canvas holding the alpha-adjusted display version of the map
+const displayCanvas = document.createElement('canvas');
+const displayCtx    = displayCanvas.getContext('2d');
+
+let dpr = Math.min(window.devicePixelRatio || 1, CFG.MAX_DPR);
+let W, H;
+let mX, mY, mW, mH; // letterboxed figure region on screen
+
+let mapLoaded = false;
+let mapW = 0, mapH = 0; // native map pixel dimensions
+let typeArr, bucketArr, outlineArr, headHandArr; // per-pixel classification, length mapW*mapH
+let nonBlackFraction = 0;
+
+const TYPE_BLACK = 0, TYPE_GREEN = 1, TYPE_COAT = 2;
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, CFG.MAX_DPR);
+  W = mapCanvas.width  = rainCanvas.width  = window.innerWidth  * dpr;
+  H = mapCanvas.height = rainCanvas.height = window.innerHeight * dpr;
+  mapCanvas.style.width  = rainCanvas.style.width  = window.innerWidth  + 'px';
+  mapCanvas.style.height = rainCanvas.style.height = window.innerHeight + 'px';
+  if (mapLoaded) {
+    computeLayout();
+    drawMapDisplay();
+    initDigits();
+  }
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ── layout ────────────────────────────────────────────────────────────────
+function computeLayout() {
+  // Letterbox: fit the full map inside the viewport with a 5% margin on each side.
+  const margin = 0.05;
+  const availW = W * (1 - 2 * margin);
+  const availH = H * (1 - 2 * margin);
+  const scale  = Math.min(availW / mapW, availH / mapH);
+  mW = mapW * scale;
+  mH = mapH * scale;
+  mX = (W - mW) / 2;
+  mY = (H - mH) / 2;
+}
+
+// Draw the static, alpha-adjusted map once onto the bottom canvas.
+// Called at load and on resize — never inside the animation loop, so it
+// cannot accumulate brightness against the rain canvas's fade.
+function drawMapDisplay() {
+  mapCtx.clearRect(0, 0, W, H);
+  mapCtx.drawImage(displayCanvas, mX, mY, mW, mH);
+}
+
+// ── map analysis (runs once at load, and again if rebuildMap() is called) ─
+function classifyMap(imgData) {
+  const w = imgData.width, h = imgData.height;
+  const n = w * h;
+  const data = imgData.data;
+
+  typeArr     = new Uint8Array(n);
+  bucketArr   = new Uint8Array(n);
+  headHandArr = new Uint8Array(n);
+  // outlineArr is built separately by computeOutline() once typeArr is ready
+
+  let nonBlack = 0;
+  let greenMinY = Infinity, greenMaxY = -Infinity;
+
+  // pass 1 — per-pixel type + brightness bucket, and green pixels' vertical extent
+  for (let i = 0; i < n; i++) {
+    const o = i * 4;
+    const r = data[o], g = data[o + 1], b = data[o + 2];
+    const lum = Math.max(r, g, b);
+
+    if (lum < CFG.BLACK_LUM_THRESHOLD) {
+      typeArr[i] = TYPE_BLACK;
+      continue;
+    }
+    nonBlack++;
+
+    const brightness = lum / 255;
+    const delta = lum - Math.min(r, g, b);
+    const sat   = delta / lum;
+
+    let type;
+    if (sat < CFG.COAT_SAT_THRESHOLD) {
+      type = TYPE_COAT;
+    } else {
+      let hue;
+      if      (lum === r) hue = 60 * (((g - b) / delta + 6) % 6);
+      else if (lum === g) hue = 60 * ((b - r) / delta + 2);
+      else                hue = 60 * ((r - g) / delta + 4);
+      type = (hue >= 60 && hue <= 175) ? TYPE_GREEN : TYPE_COAT;
+    }
+    typeArr[i] = type;
+    bucketArr[i] = brightness >= CFG.BODY_BRIGHTNESS_THRESHOLD ? 1 : 0;
+
+    if (type === TYPE_GREEN) {
+      const y = (i / w) | 0;
+      if (y < greenMinY) greenMinY = y;
+      if (y > greenMaxY) greenMaxY = y;
+    }
+  }
+  nonBlackFraction = nonBlack / n;
+
+  // pass 2 — head/hand zone. If the map has no green at all, greenMinY/MaxY
+  // stay at their Infinity sentinels, the threshold below evaluates to NaN,
+  // and every comparison against it is false — headHandArr is simply left
+  // all-zero.
+  const headHandThresholdY = greenMinY + (greenMaxY - greenMinY) * CFG.HEAD_HAND_HEIGHT_FRACTION;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      if (typeArr[i] === TYPE_GREEN && y <= headHandThresholdY) {
+        headHandArr[i] = 1;
+      }
+    }
+  }
+
+  outlineArr = computeOutline(w, h);
+}
+
+// Dilate a binary mask by `radius` map-px using a square structuring
+// element, separated into a horizontal then a vertical 1D max-pass (the
+// standard, correct decomposition for a box structuring element).
+function dilateMask(src, w, h, radius) {
+  if (radius <= 0) return src.slice();
+
+  const tmp = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const rowBase = y * w;
+    for (let x = 0; x < w; x++) {
+      let v = 0;
+      const xLo = Math.max(0, x - radius), xHi = Math.min(w - 1, x + radius);
+      for (let xx = xLo; xx <= xHi; xx++) { if (src[rowBase + xx]) { v = 1; break; } }
+      tmp[rowBase + x] = v;
+    }
+  }
+
+  const out = new Uint8Array(w * h);
+  for (let x = 0; x < w; x++) {
+    for (let y = 0; y < h; y++) {
+      let v = 0;
+      const yLo = Math.max(0, y - radius), yHi = Math.min(h - 1, y + radius);
+      for (let yy = yLo; yy <= yHi; yy++) { if (tmp[yy * w + x]) { v = 1; break; } }
+      out[y * w + x] = v;
+    }
+  }
+  return out;
+}
+
+// Build a silhouette-only outline mask:
+//  1. Dilate the non-black mask by OUTLINE_DILATE_RADIUS to close the black
+//     gaps between individual glyph characters, merging the figure into one
+//     solid blob (small stray marks elsewhere in the artwork's background
+//     dilate into their own tiny separate blobs, not this one).
+//  2. Keep only the largest connected blob — discards those stray marks.
+//  3. Flood-fill the true exterior background from the image border inward
+//     through non-blob pixels. Anything not reached (e.g. a large dark
+//     region fully enclosed by the blob, like the coat's open front) is an
+//     interior hole, not background.
+//  4. The outline is blob pixels that border true exterior — never interior
+//     holes — so it traces the figure's outer silhouette only.
+function computeOutline(w, h) {
+  const n = w * h;
+  const nonBlack = new Uint8Array(n);
+  for (let i = 0; i < n; i++) nonBlack[i] = typeArr[i] !== TYPE_BLACK ? 1 : 0;
+
+  const dilated = dilateMask(nonBlack, w, h, CFG.OUTLINE_DILATE_RADIUS);
+
+  // largest connected component of the dilated blob (4-connectivity, stack flood fill)
+  const compId = new Int32Array(n).fill(-1);
+  const visited = new Uint8Array(n);
+  const stackX = new Int32Array(n), stackY = new Int32Array(n);
+  let bestLabel = -1, bestSize = 0, label = 0;
+
+  for (let y0 = 0; y0 < h; y0++) {
+    for (let x0 = 0; x0 < w; x0++) {
+      const i0 = y0 * w + x0;
+      if (!dilated[i0] || visited[i0]) continue;
+      let sp = 0;
+      stackX[sp] = x0; stackY[sp] = y0; sp++;
+      visited[i0] = 1;
+      let size = 0;
+      while (sp > 0) {
+        sp--;
+        const cx = stackX[sp], cy = stackY[sp];
+        const ci = cy * w + cx;
+        compId[ci] = label;
+        size++;
+        if (cx > 0)     { const ni = ci - 1; if (dilated[ni] && !visited[ni]) { visited[ni] = 1; stackX[sp] = cx - 1; stackY[sp] = cy;     sp++; } }
+        if (cx < w - 1) { const ni = ci + 1; if (dilated[ni] && !visited[ni]) { visited[ni] = 1; stackX[sp] = cx + 1; stackY[sp] = cy;     sp++; } }
+        if (cy > 0)     { const ni = ci - w; if (dilated[ni] && !visited[ni]) { visited[ni] = 1; stackX[sp] = cx;     stackY[sp] = cy - 1; sp++; } }
+        if (cy < h - 1) { const ni = ci + w; if (dilated[ni] && !visited[ni]) { visited[ni] = 1; stackX[sp] = cx;     stackY[sp] = cy + 1; sp++; } }
+      }
+      if (size > bestSize) { bestSize = size; bestLabel = label; }
+      label++;
+    }
+  }
+
+  // flood-fill true exterior: non-blob pixels reachable from the image border
+  const exterior = new Uint8Array(n);
+  let sp = 0;
+  for (let x = 0; x < w; x++) {
+    const top = x, bot = (h - 1) * w + x;
+    if (!dilated[top] && !exterior[top]) { exterior[top] = 1; stackX[sp] = x; stackY[sp] = 0;     sp++; }
+    if (!dilated[bot] && !exterior[bot]) { exterior[bot] = 1; stackX[sp] = x; stackY[sp] = h - 1; sp++; }
+  }
+  for (let y = 0; y < h; y++) {
+    const lft = y * w, rgt = y * w + (w - 1);
+    if (!dilated[lft] && !exterior[lft]) { exterior[lft] = 1; stackX[sp] = 0;     stackY[sp] = y; sp++; }
+    if (!dilated[rgt] && !exterior[rgt]) { exterior[rgt] = 1; stackX[sp] = w - 1; stackY[sp] = y; sp++; }
+  }
+  while (sp > 0) {
+    sp--;
+    const cx = stackX[sp], cy = stackY[sp];
+    const ci = cy * w + cx;
+    if (cx > 0)     { const ni = ci - 1; if (!dilated[ni] && !exterior[ni]) { exterior[ni] = 1; stackX[sp] = cx - 1; stackY[sp] = cy;     sp++; } }
+    if (cx < w - 1) { const ni = ci + 1; if (!dilated[ni] && !exterior[ni]) { exterior[ni] = 1; stackX[sp] = cx + 1; stackY[sp] = cy;     sp++; } }
+    if (cy > 0)     { const ni = ci - w; if (!dilated[ni] && !exterior[ni]) { exterior[ni] = 1; stackX[sp] = cx;     stackY[sp] = cy - 1; sp++; } }
+    if (cy < h - 1) { const ni = ci + w; if (!dilated[ni] && !exterior[ni]) { exterior[ni] = 1; stackX[sp] = cx;     stackY[sp] = cy + 1; sp++; } }
+  }
+
+  // outline = pixels in the largest blob that border true exterior (image edge counts)
+  const outline = new Uint8Array(n);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      if (compId[i] !== bestLabel) continue;
+      const touchesExterior =
+        x === 0 || x === w - 1 || y === 0 || y === h - 1 ||
+        exterior[i - 1] || exterior[i + 1] || exterior[i - w] || exterior[i + w];
+      if (touchesExterior) outline[i] = 1;
+    }
+  }
+  return outline;
+}
+
+// Build the alpha-adjusted display image from the same classification:
+// body-bucket pixels solid, halo-bucket pixels dim, black fully transparent.
+function buildMapDisplay(imgData) {
+  const w = imgData.width, h = imgData.height;
+  const n = w * h;
+  const out = new ImageData(w, h);
+  const src = imgData.data, dst = out.data;
+
+  for (let i = 0; i < n; i++) {
+    const o = i * 4;
+    dst[o] = src[o]; dst[o + 1] = src[o + 1]; dst[o + 2] = src[o + 2];
+    dst[o + 3] = typeArr[i] === TYPE_BLACK
+      ? 0
+      : Math.round(255 * (bucketArr[i] ? CFG.IMG_ALPHA_BODY : CFG.IMG_ALPHA_HALO));
+  }
+  displayCanvas.width  = w;
+  displayCanvas.height = h;
+  displayCtx.putImageData(out, 0, 0);
+}
+
+// Re-run classification + display build + layout + density from current
+// CFG values, without a reload. Needed for the analysis-time constants
+// (see the comment block at the top of CFG).
+window.rebuildMap = function () {
+  if (!mapLoaded) return;
+  const imgData = analysisCtx.getImageData(0, 0, mapW, mapH);
+  classifyMap(imgData);
+  buildMapDisplay(imgData);
+  computeLayout();
+  drawMapDisplay();
+  initDigits();
+};
+
+// ── debug (temporary) ────────────────────────────────────────────────────
+// window.debugColumns(N): tracks the currently seeded digit set for N
+// animation frames, then reports (1) each column's non-black hit count,
+// (2) columns whose x sits inside the figure's horizontal rect but never
+// sampled non-black, and (3) a mid-coat horizontal scanline classification
+// at each column x. Console-only — does not touch rendering.
+window.debugColumns = function (N) {
+  N = N || 300;
+  if (!mapLoaded) { console.warn('debugColumns: map not loaded yet'); return; }
+
+  const byX = new Map(); // x -> digit objects sharing that column
+  for (const d of digits) {
+    if (!byX.has(d.x)) byX.set(d.x, []);
+    byX.get(d.x).push(d);
+  }
+  const columns = new Map();
+  for (const x of byX.keys()) columns.set(x, { x, nonBlackHits: 0, totalSamples: 0 });
+
+  let frame = 0;
+  function capture() {
+    for (const [x, col] of columns) {
+      for (const d of byX.get(x)) {
+        const s = sample(d.x, d.y);
+        col.totalSamples++;
+        if (s !== -1 && (s & 0b11) !== TYPE_BLACK) col.nonBlackHits++;
+      }
+    }
+    frame++;
+    if (frame < N) requestAnimationFrame(capture);
+    else report();
+  }
+
+  function typeName(s) {
+    if (s === -1) return 'off-map';
+    const t = s & 0b11;
+    return t === TYPE_BLACK ? 'black' : t === TYPE_GREEN ? 'green' : 'coat';
+  }
+
+  function findCoatMidY() {
+    let minY = Infinity, maxY = -Infinity;
+    for (let y = 0; y < mapH; y++) {
+      for (let x = 0; x < mapW; x++) {
+        if (typeArr[y * mapW + x] === TYPE_COAT) {
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    return (minY + maxY) / 2;
+  }
+
+  function report() {
+    const rows = [...columns.values()]
+      .map(c => ({
+        x: Math.round(c.x),
+        inFigureRectX: c.x >= mX && c.x <= mX + mW,
+        totalSamples: c.totalSamples,
+        nonBlackHits: c.nonBlackHits,
+        hitRate: c.totalSamples ? +(c.nonBlackHits / c.totalSamples).toFixed(3) : 0,
+      }))
+      .sort((a, b) => a.x - b.x);
+
+    console.log(`debugColumns: ${rows.length} columns tracked over ${N} frames. figure rect x=[${mX.toFixed(1)}, ${(mX + mW).toFixed(1)}]`);
+    console.table(rows);
+
+    const inFigure = rows.filter(r => r.inFigureRectX);
+    const deadInFigure = inFigure.filter(r => r.nonBlackHits === 0);
+    console.log(`Dead columns (x inside figure rect, zero non-black hits in ${N} frames): ${deadInFigure.length} / ${inFigure.length}`);
+    console.table(deadInFigure);
+
+    const midY = findCoatMidY();
+    const screenY = mY + (midY / mapH) * mH;
+    const scan = rows.map(r => {
+      const s = sample(r.x, screenY);
+      return { x: r.x, classification: typeName(s), nonBlackHits: r.nonBlackHits };
+    });
+    console.log(`Mid-coat scanline — map y=${midY.toFixed(1)}, screen y=${screenY.toFixed(1)}:`);
+    console.table(scan);
+
+    window.__debugColumnsResult = { rows, deadInFigure, scan, mX, mW, midY, screenY };
+  }
+
+  requestAnimationFrame(capture);
+};
+
+// ── sampling ──────────────────────────────────────────────────────────────
+// Packed lookup: bits [0-1]=type, [2]=bucket, [3]=outline, [4]=headHand.
+// Returns -1 if (x,y) falls outside the letterboxed map region.
+//
+// Averages an NxN patch of native map pixels (CFG.SAMPLE_PATCH_RADIUS map-px
+// half-width) around the point instead of reading one nearest pixel. Within
+// the patch: any green/coat pixel counts (black neighbours are ignored, not
+// diluting the result), the majority of the two picks green vs coat, and
+// bucket/outline/headHand are true if ANY pixel in the patch has them —
+// so a digit picks up a neighbouring hit rather than staying locked to one
+// permanently-dark native pixel for its whole fall.
+function sample(x, y) {
+  const fx = (x - mX) / mW;
+  const fy = (y - mY) / mH;
+  if (fx < 0 || fx >= 1 || fy < 0 || fy >= 1) return -1;
+
+  const cx = (fx * mapW) | 0;
+  const cy = (fy * mapH) | 0;
+  const radius = CFG.SAMPLE_PATCH_RADIUS;
+
+  if (radius <= 0) {
+    const i = cy * mapW + cx;
+    return typeArr[i] | (bucketArr[i] << 2) | (outlineArr[i] << 3) | (headHandArr[i] << 4);
+  }
+
+  const x0 = Math.max(0, cx - radius), x1 = Math.min(mapW - 1, cx + radius);
+  const y0 = Math.max(0, cy - radius), y1 = Math.min(mapH - 1, cy + radius);
+
+  let greenCount = 0, coatCount = 0, bodyAny = 0, outlineAny = 0, headHandAny = 0;
+  for (let py = y0; py <= y1; py++) {
+    const rowBase = py * mapW;
+    for (let px = x0; px <= x1; px++) {
+      const i = rowBase + px;
+      const t = typeArr[i];
+      if (t === TYPE_BLACK) continue;
+      if (t === TYPE_GREEN) greenCount++; else coatCount++;
+      if (bucketArr[i]) bodyAny = 1;
+      if (outlineArr[i]) outlineAny = 1;
+      if (headHandArr[i]) headHandAny = 1;
+    }
+  }
+
+  if (greenCount === 0 && coatCount === 0) return TYPE_BLACK;
+  const type = greenCount >= coatCount ? TYPE_GREEN : TYPE_COAT;
+  return type | (bodyAny << 2) | (outlineAny << 3) | (headHandAny << 4);
+}
+
+// ── digits ────────────────────────────────────────────────────────────────
+let digits = [];
+
+function initDigits() {
+  digits = [];
+  const pitch = CFG.GLYPH_SIZE * dpr * 0.75;
+  const totalCols = Math.max(1, Math.ceil(W / pitch));
+  const avgStreamLen = (CFG.STREAM_LEN_MIN + CFG.STREAM_LEN_MAX) / 2;
+
+  // Solve for how many glyphs we need in total so that, on average,
+  // TARGET_FIGURE_GLYPHS land on non-black map pixels: P(a random on-screen
+  // point hits the figure) = nonBlackFraction * (map area / screen area).
+  const figureHitProb = Math.max(nonBlackFraction * (mW * mH) / (W * H), 0.0001);
+  const totalGlyphsWanted = CFG.TARGET_FIGURE_GLYPHS / figureHitProb;
+  const idealPerColumn = totalGlyphsWanted / totalCols;
+
+  // Normal case: every column stays active, and gets its own share of the
+  // total — stream length scaled from the per-column ideal, jittered by the
+  // same spread STREAM_LEN_MIN/MAX has around their mean, floored at 1 so no
+  // column is ever literally empty.
+  //
+  // Fallback case: the target is sparser than one digit per column even at
+  // the floor, so hitting it at all requires leaving some columns empty.
+  // Which ones is decided by a forced-activation counter, not an
+  // independent coin flip per column — that guarantees no run of empty
+  // columns longer than MAX_CONSECUTIVE_CULLED_COLUMNS, instead of the
+  // unbounded runs a per-column Math.random() produces.
+  const useCulling = idealPerColumn < 1;
+  const activeFraction = useCulling ? Math.min(1, totalGlyphsWanted / (totalCols * avgStreamLen)) : 1;
+  const jitterLow  = CFG.STREAM_LEN_MIN / avgStreamLen;
+  const jitterHigh = CFG.STREAM_LEN_MAX / avgStreamLen;
+
+  let sinceActive = 0;
+  for (let c = 0; c < totalCols; c++) {
+    let active;
+    if (!useCulling) {
+      active = true;
+    } else {
+      const mustActivate = sinceActive >= CFG.MAX_CONSECUTIVE_CULLED_COLUMNS;
+      active = mustActivate || Math.random() < activeFraction;
+    }
+    if (!active) { sinceActive++; continue; }
+    sinceActive = 0;
+
+    const x = c * pitch + Math.random() * pitch * 0.8;
+    const streamLen = useCulling
+      ? CFG.STREAM_LEN_MIN + Math.floor(Math.random() * (CFG.STREAM_LEN_MAX - CFG.STREAM_LEN_MIN))
+      : Math.max(1, Math.round(idealPerColumn * (jitterLow + Math.random() * (jitterHigh - jitterLow))));
+
+    // spread the stream to roughly span the screen height regardless of how
+    // few digits it has, instead of clumping them glyph-tight and leaving a
+    // long bare stretch behind them
+    const span = H * (0.8 + Math.random() * 0.4);
+    const gap  = Math.max(CFG.GLYPH_SIZE * dpr, span / streamLen);
+
+    const headY = Math.random() * H;
+    const speed = (CFG.SPEED_MIN + Math.random() * (CFG.SPEED_MAX - CFG.SPEED_MIN)) * dpr;
+
+    for (let d = 0; d < streamLen; d++) {
+      digits.push({
+        x,
+        y: headY - d * gap,
+        speed: speed * (0.93 + Math.random() * 0.14),
+        gap,
+        glyph: Math.random() < 0.5 ? '0' : '1',
+        glyphTimer: Math.floor(Math.random() * 20),
+        glyphInterval: 4 + Math.floor(Math.random() * 22),
+      });
+    }
+  }
+}
+
+// ── render ────────────────────────────────────────────────────────────────
+const reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
+
+function drawDigits() {
+  rainCtx.font = `${CFG.GLYPH_SIZE * dpr}px monospace`;
+
+  for (const d of digits) {
+    const s = sample(d.x, d.y);
+    if (s === -1) continue;
+
+    const type       = s & 0b11;
+    const isBody     = (s >> 2) & 1;
+    const isOutline  = (s >> 3) & 1;
+    const isHeadHand = (s >> 4) & 1;
+
+    // thin the rain over the head/hand zone
+    if (isHeadHand && Math.random() > CFG.HEAD_HAND_DENSITY) continue;
+
+    let color, alpha;
+    if (type === TYPE_BLACK) {
+      color = CFG.COLOR_BG;
+      alpha = CFG.BG_ALPHA;
+    } else {
+      // any non-black sample snaps straight to full brightness — no ramp
+      color = type === TYPE_GREEN
+        ? CFG.COLOR_GREEN
+        : (isBody ? CFG.COLOR_COAT_BODY : CFG.COLOR_COAT_HALO);
+      alpha = CFG.FIGURE_ALPHA;
+    }
+    if (isOutline && CFG.OUTLINE_ENABLED) {
+      // forced regardless of region — the defining edge
+      color = CFG.COLOR_OUTLINE;
+      alpha = CFG.FIGURE_ALPHA;
+    }
+
+    rainCtx.fillStyle = `rgba(${color[0]},${color[1]},${color[2]},${alpha})`;
+    rainCtx.fillText(d.glyph, d.x, d.y);
+  }
+}
+
+function advanceDigits() {
+  for (const d of digits) {
+    d.y += d.speed;
+    d.glyphTimer++;
+    if (d.glyphTimer >= d.glyphInterval) {
+      d.glyph = Math.random() < 0.5 ? '0' : '1';
+      d.glyphTimer = 0;
+      d.glyphInterval = 4 + Math.floor(Math.random() * 22);
+    }
+    if (d.y > H + CFG.GLYPH_SIZE * dpr * 2) {
+      d.y = -(d.gap * (1 + Math.random() * 5));
+      d.speed = (CFG.SPEED_MIN + Math.random() * (CFG.SPEED_MAX - CFG.SPEED_MIN)) * dpr;
+    }
+  }
+}
+
+function loop() {
+  if (reduced.matches) return;
+
+  // Fade existing trails toward transparent (destination-out) instead of
+  // painting black over them — the map canvas underneath never darkens.
+  rainCtx.globalCompositeOperation = 'destination-out';
+  rainCtx.fillStyle = `rgba(0,0,0,${CFG.FADE})`;
+  rainCtx.fillRect(0, 0, W, H);
+  rainCtx.globalCompositeOperation = 'source-over';
+
+  drawDigits();
+  advanceDigits();
+  requestAnimationFrame(loop);
+}
+
+function renderStatic() {
+  rainCtx.clearRect(0, 0, W, H);
+  drawDigits();
+}
+
+reduced.addEventListener('change', () => {
+  if (!reduced.matches) requestAnimationFrame(loop);
+  else renderStatic();
+});
+
+// ── boot ──────────────────────────────────────────────────────────────────
+const img = new Image();
+img.onload = function () {
+  mapW = img.naturalWidth;
+  mapH = img.naturalHeight;
+
+  analysisCanvas.width  = mapW;
+  analysisCanvas.height = mapH;
+  analysisCtx.drawImage(img, 0, 0);
+  const imgData = analysisCtx.getImageData(0, 0, mapW, mapH);
+
+  classifyMap(imgData);
+  buildMapDisplay(imgData);
+
+  mapLoaded = true;
+  computeLayout();
+  drawMapDisplay();
+  initDigits();
+
+  if (reduced.matches) renderStatic();
+  else requestAnimationFrame(loop);
+};
+img.onerror = function () {
+  console.error('Bytegeist: failed to load map image');
+};
+img.src = 'data:image/png;base64,' + MAP_B64;
+</script>
+</body>
+</html>

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Bytegeist</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:#000;overflow:hidden}
+canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script src="map.js"></script>
+<script>
+// Offscreen map declared first — before resize() so the mapLoaded guard
+// inside resize() never hits the temporal dead zone.
+const offscreen = document.createElement('canvas');
+const offCtx    = offscreen.getContext('2d');
+let mapData   = null;
+let mapLoaded = false;
+let mX, mY, mW, mH; // letterboxed figure region
+
+// ── canvas ────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const dpr    = Math.min(window.devicePixelRatio || 1, 2);
+
+let W, H;
+function resize() {
+  W = canvas.width  = window.innerWidth  * dpr;
+  H = canvas.height = window.innerHeight * dpr;
+  canvas.style.width  = window.innerWidth  + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+  if (mapLoaded) { computeLayout(); initDigits(); }
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ── map layout ────────────────────────────────────────────────────────────
+function computeLayout() {
+  // Letterbox: fit the full map inside the viewport with a 5 % margin on each side.
+  // Scale is whichever axis would overflow first; the other axis gets padding.
+  const margin = 0.05;
+  const availW = W * (1 - 2 * margin);
+  const availH = H * (1 - 2 * margin);
+  const scale  = Math.min(availW / offscreen.width, availH / offscreen.height);
+  mW = offscreen.width  * scale;
+  mH = offscreen.height * scale;
+  mX = (W - mW) / 2;
+  mY = (H - mH) / 2;
+}
+
+// ── map sampling → { type: 'black'|'green'|'coat', brightness } ──────────
+function sample(x, y) {
+  const fx = (x - mX) / mW;
+  const fy = (y - mY) / mH;
+  if (fx < 0 || fx >= 1 || fy < 0 || fy >= 1)
+    return { type: 'black', brightness: 0 };
+
+  const mx = Math.floor(fx * offscreen.width);
+  const my = Math.floor(fy * offscreen.height);
+  const i  = (my * offscreen.width + mx) * 4;
+  const r  = mapData.data[i];
+  const g  = mapData.data[i + 1];
+  const b  = mapData.data[i + 2];
+
+  const lum = Math.max(r, g, b);
+  if (lum < 14) return { type: 'black', brightness: 0 };
+
+  const brightness = lum / 255;
+  const delta = lum - Math.min(r, g, b);
+  const sat   = delta / lum;
+
+  // low saturation → coat (pale/white-ish)
+  if (sat < 0.28) return { type: 'coat', brightness };
+
+  // compute hue
+  let hue;
+  if      (lum === r) hue = 60 * (((g - b) / delta + 6) % 6);
+  else if (lum === g) hue = 60 * ((b - r) / delta + 2);
+  else                hue = 60 * ((r - g) / delta + 4);
+
+  if (hue >= 60 && hue <= 175) return { type: 'green', brightness };
+  if (hue >  175 && hue <= 270) return { type: 'coat',  brightness };
+  return { type: 'black', brightness: 0 };
+}
+
+// ── digits ────────────────────────────────────────────────────────────────
+let digits = [];
+
+function initDigits() {
+  digits = [];
+  const BASE  = 13 * dpr;
+  const pitch = BASE * 0.70;
+  const cols  = Math.ceil(W / pitch);
+
+  for (let c = 0; c < cols; c++) {
+    if (Math.random() < 0.12) continue;
+    const x         = c * pitch + Math.random() * pitch * 0.8;
+    const fontSize  = BASE * (0.50 + Math.random() * 0.40);
+    const speed     = (0.8 + Math.random() * 2.5) * dpr;
+    const streamLen = 6 + Math.floor(Math.random() * 20);
+    const gap       = fontSize * (1.0 + Math.random() * 0.30);
+    const headY     = Math.random() * H;
+
+    for (let d = 0; d < streamLen; d++) {
+      digits.push({
+        x,
+        y:             headY - d * gap,
+        speed:         speed * (0.93 + Math.random() * 0.14),
+        fontSize, gap,
+        glyph:         Math.random() < 0.5 ? '0' : '1',
+        glyphTimer:    Math.floor(Math.random() * 20),
+        glyphInterval: 4 + Math.floor(Math.random() * 22),
+      });
+    }
+  }
+}
+
+// ── render ────────────────────────────────────────────────────────────────
+const FADE    = 0.09;
+const reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
+
+function drawDigits() {
+  for (const d of digits) {
+    const s = sample(d.x, d.y);
+    let style, size;
+
+    if (s.type === 'green') {
+      const bv = s.brightness;
+      const gv = Math.floor(80 + bv * 175);
+      style = 'rgba(0,' + gv + ',0,' + (0.6 + bv * 0.4) + ')';
+      size  = d.fontSize * (1.1 + bv * 0.3);
+    } else if (s.type === 'coat') {
+      const bv = s.brightness;
+      const cr = Math.floor(111 + 131 * bv);
+      const cg = Math.floor(168 + 78  * bv);
+      const cb = Math.floor(216 + 34  * bv);
+      style = 'rgba(' + cr + ',' + cg + ',' + cb + ',' + (0.6 + bv * 0.4) + ')';
+      size  = d.fontSize * (1.0 + bv * 0.2);
+    } else {
+      style = 'rgba(0,140,0,' + (0.04 + Math.random() * 0.04) + ')';
+      size  = d.fontSize * 0.65;
+    }
+
+    ctx.font      = size + 'px monospace';
+    ctx.fillStyle = style;
+    ctx.fillText(d.glyph, d.x, d.y);
+  }
+}
+
+function advanceDigits() {
+  for (const d of digits) {
+    d.y += d.speed;
+    d.glyphTimer++;
+    if (d.glyphTimer >= d.glyphInterval) {
+      d.glyph        = Math.random() < 0.5 ? '0' : '1';
+      d.glyphTimer   = 0;
+      d.glyphInterval = 4 + Math.floor(Math.random() * 22);
+    }
+    if (d.y > H + 24) {
+      d.y    = -(d.gap * (1 + Math.random() * 5));
+      d.speed = (0.8 + Math.random() * 2.5) * dpr;
+    }
+  }
+}
+
+function loop() {
+  if (reduced.matches) {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 0.5;
+    ctx.drawImage(offscreen, mX, mY, mW, mH);
+    ctx.globalAlpha = 1;
+    drawDigits();
+    return;
+  }
+
+  ctx.fillStyle = 'rgba(0,0,0,' + FADE + ')';
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalAlpha = 0.5;
+  ctx.drawImage(offscreen, mX, mY, mW, mH);
+  ctx.globalAlpha = 1;
+  drawDigits();
+  advanceDigits();
+  requestAnimationFrame(loop);
+}
+
+reduced.addEventListener('change', () => {
+  if (!reduced.matches) requestAnimationFrame(loop);
+  else {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 0.5;
+    ctx.drawImage(offscreen, mX, mY, mW, mH);
+    ctx.globalAlpha = 1;
+    drawDigits();
+  }
+});
+
+// ── boot ──────────────────────────────────────────────────────────────────
+const img  = new Image();
+img.onload = function () {
+  offscreen.width  = img.naturalWidth;
+  offscreen.height = img.naturalHeight;
+  offCtx.drawImage(img, 0, 0);
+  mapData   = offCtx.getImageData(0, 0, offscreen.width, offscreen.height);
+  mapLoaded = true;
+  computeLayout();
+  initDigits();
+  requestAnimationFrame(loop);
+};
+img.onerror = function () {
+  console.error('Bytegeist: failed to load map image');
+};
+img.src = 'data:image/png;base64,' + MAP_B64;
+
+// ── public API stubs ──────────────────────────────────────────────────────
+window.setState = function (name) {};
+window.flare    = function ()     {};
+</script>
+</body>
+</html>

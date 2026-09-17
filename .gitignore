@@ -1,0 +1,6 @@
+# Debug artifacts generated while diagnosing the map/sampling pipeline
+_gap_diagnostic.png
+_outline_check.png
+_*.png
+_*.json
+_*.js
