@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#000000">
 <title>Bytegeist</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -687,6 +689,22 @@ img.onerror = function () {
   console.error('Bytegeist: failed to load map image');
 };
 img.src = 'data:image/png;base64,' + MAP_B64;
+
+// ── wake lock ────────────────────────────────────────────────────────────
+// Keep the screen on while the page is open. Released automatically by the
+// browser whenever the tab is hidden, so re-acquire on visibilitychange.
+// Fails silently — unsupported browser, no permission, battery saver, etc.
+let wakeLock = null;
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+  } catch (e) {}
+}
+requestWakeLock();
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') requestWakeLock();
+});
 </script>
 </body>
 </html>
