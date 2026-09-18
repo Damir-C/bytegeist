@@ -36,17 +36,17 @@ dense body, not coat. Test hue first, then brightness.
 
 The map is never sampled live from its own pixels during the render loop.
 Instead it's classified once (at load, or on `rebuildMap()`) into typed
-lookup arrays (`typeArr`, `bucketArr`, `outlineArr`, `headHandArr`), and
-`sample(x, y)` reads those arrays each frame. This trades a one-time
-classification pass for a cheap per-frame lookup.
+lookup arrays (`typeArr`, `bucketArr`, `outlineArr`), and `sample(x, y)`
+reads those arrays each frame. This trades a one-time classification pass
+for a cheap per-frame lookup. Density overrides for specific regions (head,
+hands) are handled separately, live, via `CFG.ZONES` — see below.
 
 ## Core algorithm
 
 1. Load the map into an offscreen analysis canvas once at startup. Classify
    every pixel into black / green / coat, a body-vs-halo brightness bucket,
-   a head/hand-zone flag, and a silhouette-outline flag. Store these as flat
-   `Uint8Array`s the same size as the map, not a `getImageData` re-read per
-   frame.
+   and a silhouette-outline flag. Store these as flat `Uint8Array`s the same
+   size as the map, not a `getImageData` re-read per frame.
 2. Build a static, alpha-adjusted display copy of the map from the same
    classification (body-bucket pixels solid, halo-bucket pixels dim, black
    transparent) and draw it once to `mapCanvas`.
@@ -65,8 +65,11 @@ classification pass for a cheap per-frame lookup.
    - **Non-black** — snaps straight to full brightness, no ramp: green for
      body/skin, near-white or blue depending on brightness bucket for the
      coat.
-   - Head/hand zone — thinned independently by `HEAD_HAND_DENSITY`,
-     regardless of type.
+   - **Zones** — if the sample is `TYPE_GREEN` and the digit's map-normalized
+     position falls inside a `CFG.ZONES` rectangle, it's thinned to that
+     zone's `density` (lowest, if it's inside more than one). Coat pixels are
+     never affected by zones, even inside a zone rectangle — see "Hand/head
+     zones" below.
 5. Digits recycle to the top at randomised `y` and `speed` when they exit the
    bottom, so columns never fall into lockstep.
 6. Fade via `destination-out` on the rain canvas each frame
@@ -86,6 +89,31 @@ randomised stream length and speed, and streams spread to roughly span the
 screen height regardless of digit count (`gap` computed from a randomised
 target span, not fixed glyph spacing) so short streams don't clump instead of
 trailing.
+
+## Hand/head zones
+
+Density over the head and hands is controlled by `CFG.ZONES`: explicit
+rectangles in map-normalized coordinates (0–1 relative to the map image's
+own width/height, not the screen), each with a `density` multiplier. This
+replaced an earlier approach (`headHandArr`) that derived a single "head"
+zone from the top fraction of the green pixels' vertical span
+(`HEAD_HAND_HEIGHT_FRACTION`) — it only ever covered the head, never the
+hands, despite the name, since the hands typically sit well below that
+fraction of the figure's green span.
+
+Rules:
+- A pixel counts as "inside" a zone only if it's within the rectangle *and*
+  classified `TYPE_GREEN`. Coat pixels inside a zone rectangle are
+  unaffected — this is what lets the rectangles be drawn crude (e.g.
+  overlapping the coat sleeve) without over-thinning the coat.
+- Where zones overlap, the lowest `density` applies.
+- Zones are evaluated live, per digit, per frame, directly against
+  `CFG.ZONES` — no `rebuildMap()` or `initDigits()` needed after editing a
+  rectangle or density value.
+- `CFG.SHOW_ZONES` (default `false`) draws each zone rectangle as a thin
+  outline on the rain canvas, for positioning them by eye from the console.
+
+Default zones: one over the head, one over each hand, all at density `0.5`.
 
 ## Approaches tried and rejected
 
@@ -133,8 +161,8 @@ categories, by how a change actually takes effect:
 - `OUTLINE_ENABLED`, `BG_ALPHA`, `FIGURE_ALPHA`, `FADE`, `SAMPLE_PATCH_RADIUS`
 - `COLOR_BG`, `COLOR_GREEN`, `COLOR_COAT_BODY`, `COLOR_COAT_HALO`,
   `COLOR_OUTLINE`
-- `HEAD_HAND_DENSITY` — read per-frame in `drawDigits()`, despite sitting in
-  the CFG block's "density" section; it is not tied to `initDigits()`.
+- `ZONES`, `SHOW_ZONES` — read per-digit, per-frame in `drawDigits()`; edit
+  rectangle coordinates or densities from the console with no rebuild.
 - `SPEED_MIN` / `SPEED_MAX` — read whenever a digit is created or recycles,
   so a change phases in gradually as existing digits cycle rather than
   applying to everything at once.
@@ -157,8 +185,7 @@ call `window.resize()` to force one):**
 
 **Needs `rebuildMap()`** (also exposed on `window`) — baked once into
 per-pixel classification lookup tables for performance:
-- `BLACK_LUM_THRESHOLD`, `COAT_SAT_THRESHOLD`, `BODY_BRIGHTNESS_THRESHOLD`,
-  `HEAD_HAND_HEIGHT_FRACTION`
+- `BLACK_LUM_THRESHOLD`, `COAT_SAT_THRESHOLD`, `BODY_BRIGHTNESS_THRESHOLD`
 - `OUTLINE_DILATE_RADIUS` — map-px radius that closes the inter-glyph black
   gaps before tracing the silhouette (see "outline mask" above). Needs to
   bridge glyph gaps without padding the true outer silhouette outward; does
@@ -214,7 +241,7 @@ why warping works here and would not work on a photograph.
 - Respect `prefers-reduced-motion` (renders a static frame instead of
   looping).
 - Figure sits per `FIGURE_ANCHOR_Y`/`FIGURE_MARGIN`/`FIGURE_SCALE`; digits
-  thin toward the head/hand zone so facial detail isn't buried, and the
+  thin over the head/hand `ZONES` so facial detail isn't buried, and the
   lower portion stays sparse enough for app text to sit over the dark area.
 
 ## Build order status
