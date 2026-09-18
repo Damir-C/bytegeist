@@ -24,15 +24,16 @@ html,body{width:100%;height:100%;background:#000;overflow:hidden}
 // from the console with no reload, e.g. `CFG.FADE = 0.2`.
 //
 // Exception: the map-CLASSIFICATION constants (BLACK_LUM_THRESHOLD,
-// COAT_SAT_THRESHOLD, BODY_BRIGHTNESS_THRESHOLD, IMG_ALPHA_BODY,
-// IMG_ALPHA_HALO, OUTLINE_DILATE_RADIUS) are baked once into per-pixel
-// lookup tables for performance — changing one takes effect after calling
-// `rebuildMap()` (also exposed on window), not on the next frame.
+// COAT_SAT_THRESHOLD, BODY_BRIGHTNESS_THRESHOLD, HEAD_HAND_HEIGHT_FRACTION,
+// IMG_ALPHA_BODY, IMG_ALPHA_HALO, OUTLINE_DILATE_RADIUS) are baked once into
+// per-pixel lookup tables for performance — changing one takes effect after
+// calling `rebuildMap()` (also exposed on window), not on the next frame.
 const CFG = {
   // -- map classification (needs rebuildMap() after changing) --
   BLACK_LUM_THRESHOLD: 14,          // max(r,g,b) below this = empty space
   COAT_SAT_THRESHOLD: 0.28,         // saturation below this, on a non-black px = coat rather than green
   BODY_BRIGHTNESS_THRESHOLD: 0.45,  // brightness (0-1) at/above this = "body" bucket, below = "halo"
+  HEAD_HAND_HEIGHT_FRACTION: 0.35,  // top fraction of the green pixels' vertical span counted as head/hand
   // The source artwork is made of individually separated digit glyphs with
   // black gaps between them, so almost every non-black pixel has a black
   // neighbour — a naive "black neighbour = outline" test flags nearly the
@@ -47,7 +48,7 @@ const CFG = {
   OUTLINE_DILATE_RADIUS: 6,
 
   // -- static map image, bottom canvas (needs rebuildMap() after changing) --
-  IMG_ALPHA_BODY: 0.5,              // opacity of solid body-bucket map pixels
+  IMG_ALPHA_BODY: 0.92,             // opacity of solid body-bucket map pixels
   IMG_ALPHA_HALO: 0.16,             // opacity of dim halo/edge-bucket map pixels
 
   // -- sampling (live) --
@@ -76,7 +77,8 @@ const CFG = {
                           // in the rare fallback where whole columns get culled — see initDigits().
 
   // -- density (structural — applied on next initDigits/resize) --
-  TARGET_FIGURE_GLYPHS: 150,  // average glyphs expected to be sitting on the (non-black) figure at once
+  TARGET_FIGURE_GLYPHS: 120,  // average glyphs expected to be sitting on the (non-black) figure at once
+  HEAD_HAND_DENSITY: 0.25,    // fraction of normal draw rate kept over the head/hand zone (thinning)
   // Density is normally controlled per-column (stream length + spacing),
   // never by deleting whole columns — random independent per-column culling
   // produced long runs of consecutive empty columns purely by chance (dead
@@ -85,21 +87,6 @@ const CFG = {
   // target is so sparse that even one digit per column would overshoot it,
   // and even then this caps how many consecutive columns it may drop.
   MAX_CONSECUTIVE_CULLED_COLUMNS: 1,
-
-  // -- zones (live) --
-  // Explicit density-override rectangles in map-normalized coordinates
-  // (0-1 relative to the map image's own width/height, not the screen) so
-  // they survive resizing without recomputation. A rectangle only affects
-  // TYPE_GREEN pixels inside it — coat pixels are untouched — which is what
-  // lets the rectangles be drawn crude without leaking onto the coat. Where
-  // zones overlap, the lowest density applies. Read live every frame in
-  // drawDigits() — edit coordinates from the console with no rebuild.
-  ZONES: [
-    { x: 0.30, y: 0.00, w: 0.40, h: 0.18, density: 0.5 }, // head
-    { x: 0.02, y: 0.30, w: 0.20, h: 0.20, density: 0.5 }, // left hand
-    { x: 0.78, y: 0.30, w: 0.20, h: 0.20, density: 0.5 }, // right hand
-  ],
-  SHOW_ZONES: false, // draw ZONES as thin outlines on the rain canvas, for eyeballing placement
 
   // -- colour (live) --
   COLOR_BG:        [70, 190, 90],    // background (black-sampling) rain
@@ -140,7 +127,7 @@ let mX, mY, mW, mH; // letterboxed figure region on screen
 
 let mapLoaded = false;
 let mapW = 0, mapH = 0; // native map pixel dimensions
-let typeArr, bucketArr, outlineArr; // per-pixel classification, length mapW*mapH
+let typeArr, bucketArr, outlineArr, headHandArr; // per-pixel classification, length mapW*mapH
 let nonBlackFraction = 0;
 
 const TYPE_BLACK = 0, TYPE_GREEN = 1, TYPE_COAT = 2;
@@ -190,13 +177,15 @@ function classifyMap(imgData) {
   const n = w * h;
   const data = imgData.data;
 
-  typeArr   = new Uint8Array(n);
-  bucketArr = new Uint8Array(n);
+  typeArr     = new Uint8Array(n);
+  bucketArr   = new Uint8Array(n);
+  headHandArr = new Uint8Array(n);
   // outlineArr is built separately by computeOutline() once typeArr is ready
 
   let nonBlack = 0;
+  let greenMinY = Infinity, greenMaxY = -Infinity;
 
-  // pass 1 — per-pixel type + brightness bucket
+  // pass 1 — per-pixel type + brightness bucket, and green pixels' vertical extent
   for (let i = 0; i < n; i++) {
     const o = i * 4;
     const r = data[o], g = data[o + 1], b = data[o + 2];
@@ -224,8 +213,28 @@ function classifyMap(imgData) {
     }
     typeArr[i] = type;
     bucketArr[i] = brightness >= CFG.BODY_BRIGHTNESS_THRESHOLD ? 1 : 0;
+
+    if (type === TYPE_GREEN) {
+      const y = (i / w) | 0;
+      if (y < greenMinY) greenMinY = y;
+      if (y > greenMaxY) greenMaxY = y;
+    }
   }
   nonBlackFraction = nonBlack / n;
+
+  // pass 2 — head/hand zone. If the map has no green at all, greenMinY/MaxY
+  // stay at their Infinity sentinels, the threshold below evaluates to NaN,
+  // and every comparison against it is false — headHandArr is simply left
+  // all-zero.
+  const headHandThresholdY = greenMinY + (greenMaxY - greenMinY) * CFG.HEAD_HAND_HEIGHT_FRACTION;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      if (typeArr[i] === TYPE_GREEN && y <= headHandThresholdY) {
+        headHandArr[i] = 1;
+      }
+    }
+  }
 
   outlineArr = computeOutline(w, h);
 }
@@ -465,15 +474,15 @@ window.debugColumns = function (N) {
 };
 
 // ── sampling ──────────────────────────────────────────────────────────────
-// Packed lookup: bits [0-1]=type, [2]=bucket, [3]=outline.
+// Packed lookup: bits [0-1]=type, [2]=bucket, [3]=outline, [4]=headHand.
 // Returns -1 if (x,y) falls outside the letterboxed map region.
 //
 // Averages an NxN patch of native map pixels (CFG.SAMPLE_PATCH_RADIUS map-px
 // half-width) around the point instead of reading one nearest pixel. Within
 // the patch: any green/coat pixel counts (black neighbours are ignored, not
 // diluting the result), the majority of the two picks green vs coat, and
-// bucket/outline are true if ANY pixel in the patch has them — so a digit
-// picks up a neighbouring hit rather than staying locked to one
+// bucket/outline/headHand are true if ANY pixel in the patch has them —
+// so a digit picks up a neighbouring hit rather than staying locked to one
 // permanently-dark native pixel for its whole fall.
 function sample(x, y) {
   const fx = (x - mX) / mW;
@@ -486,13 +495,13 @@ function sample(x, y) {
 
   if (radius <= 0) {
     const i = cy * mapW + cx;
-    return typeArr[i] | (bucketArr[i] << 2) | (outlineArr[i] << 3);
+    return typeArr[i] | (bucketArr[i] << 2) | (outlineArr[i] << 3) | (headHandArr[i] << 4);
   }
 
   const x0 = Math.max(0, cx - radius), x1 = Math.min(mapW - 1, cx + radius);
   const y0 = Math.max(0, cy - radius), y1 = Math.min(mapH - 1, cy + radius);
 
-  let greenCount = 0, coatCount = 0, bodyAny = 0, outlineAny = 0;
+  let greenCount = 0, coatCount = 0, bodyAny = 0, outlineAny = 0, headHandAny = 0;
   for (let py = y0; py <= y1; py++) {
     const rowBase = py * mapW;
     for (let px = x0; px <= x1; px++) {
@@ -502,12 +511,13 @@ function sample(x, y) {
       if (t === TYPE_GREEN) greenCount++; else coatCount++;
       if (bucketArr[i]) bodyAny = 1;
       if (outlineArr[i]) outlineAny = 1;
+      if (headHandArr[i]) headHandAny = 1;
     }
   }
 
   if (greenCount === 0 && coatCount === 0) return TYPE_BLACK;
   const type = greenCount >= coatCount ? TYPE_GREEN : TYPE_COAT;
-  return type | (bodyAny << 2) | (outlineAny << 3);
+  return type | (bodyAny << 2) | (outlineAny << 3) | (headHandAny << 4);
 }
 
 // ── digits ────────────────────────────────────────────────────────────────
@@ -585,28 +595,6 @@ function initDigits() {
 // ── render ────────────────────────────────────────────────────────────────
 const reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
 
-// Lowest density among CFG.ZONES containing map-normalized point (fx, fy),
-// or 1 (no thinning) if none match. Read live every frame — see CFG.ZONES.
-function zoneDensityAt(fx, fy) {
-  let density = 1;
-  for (const z of CFG.ZONES) {
-    if (fx >= z.x && fx < z.x + z.w && fy >= z.y && fy < z.y + z.h && z.density < density) {
-      density = z.density;
-    }
-  }
-  return density;
-}
-
-function drawZoneOutlines() {
-  rainCtx.save();
-  rainCtx.strokeStyle = 'rgba(255,0,255,0.9)';
-  rainCtx.lineWidth = 1;
-  for (const z of CFG.ZONES) {
-    rainCtx.strokeRect(mX + z.x * mW, mY + z.y * mH, z.w * mW, z.h * mH);
-  }
-  rainCtx.restore();
-}
-
 function drawDigits() {
   rainCtx.font = `${CFG.GLYPH_SIZE * dpr}px monospace`;
 
@@ -616,18 +604,13 @@ function drawDigits() {
 
     // Outside the letterboxed map rect entirely (e.g. above/below the
     // figure on a tall screen) — still background rain, not empty space.
-    const type      = offMap ? TYPE_BLACK : (s & 0b11);
-    const isBody    = offMap ? 0 : (s >> 2) & 1;
-    const isOutline = offMap ? 0 : (s >> 3) & 1;
+    const type       = offMap ? TYPE_BLACK : (s & 0b11);
+    const isBody     = offMap ? 0 : (s >> 2) & 1;
+    const isOutline  = offMap ? 0 : (s >> 3) & 1;
+    const isHeadHand = offMap ? 0 : (s >> 4) & 1;
 
-    // Zone density override — TYPE_GREEN pixels only; coat is untouched so
-    // the rectangles can be drawn crude without leaking onto the coat.
-    if (type === TYPE_GREEN) {
-      const fx = (d.x - mX) / mW;
-      const fy = (d.y - mY) / mH;
-      const density = zoneDensityAt(fx, fy);
-      if (density < 1 && Math.random() > density) continue;
-    }
+    // thin the rain over the head/hand zone
+    if (isHeadHand && Math.random() > CFG.HEAD_HAND_DENSITY) continue;
 
     let color, alpha;
     if (type === TYPE_BLACK) {
@@ -649,8 +632,6 @@ function drawDigits() {
     rainCtx.fillStyle = `rgba(${color[0]},${color[1]},${color[2]},${alpha})`;
     rainCtx.fillText(d.glyph, d.x, d.y);
   }
-
-  if (CFG.SHOW_ZONES) drawZoneOutlines();
 }
 
 function advanceDigits() {
