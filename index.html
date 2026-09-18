@@ -48,7 +48,7 @@ const CFG = {
   OUTLINE_DILATE_RADIUS: 6,
 
   // -- static map image, bottom canvas (needs rebuildMap() after changing) --
-  IMG_ALPHA_BODY: 0.92,             // opacity of solid body-bucket map pixels
+  IMG_ALPHA_BODY: 0.7,               // opacity of solid body-bucket map pixels
   IMG_ALPHA_HALO: 0.16,             // opacity of dim halo/edge-bucket map pixels
 
   // -- sampling (live) --
@@ -77,7 +77,7 @@ const CFG = {
                           // in the rare fallback where whole columns get culled — see initDigits().
 
   // -- density (structural — applied on next initDigits/resize) --
-  TARGET_FIGURE_GLYPHS: 120,  // average glyphs expected to be sitting on the (non-black) figure at once
+  TARGET_FIGURE_GLYPHS: 150,  // average glyphs expected to be sitting on the (non-black) figure at once
   HEAD_HAND_DENSITY: 0.25,    // fraction of normal draw rate kept over the head/hand zone (thinning)
   // Density is normally controlled per-column (stream length + spacing),
   // never by deleting whole columns — random independent per-column culling
