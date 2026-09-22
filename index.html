@@ -69,7 +69,7 @@ const CFG = {
   BG_ALPHA: 0.2,         // digit alpha while sampling black — background rain, must read clearly
   FIGURE_ALPHA: 0.7,     // digit alpha the instant it samples any non-black pixel — snaps here, no ramp
   FADE: 0.14,            // per-frame trail fade (destination-out alpha on the rain canvas). lower = longer tails
-  GLYPH_SIZE: 11,        // uniform glyph size in CSS px — one size, no per-region variance
+  GLYPH_SIZE: 10,       // uniform glyph size in CSS px — one size, no per-region variance
   SPEED_MIN: 1.2,        // uniform fall speed range in CSS px/frame — one range, no per-region multiplier
   SPEED_MAX: 2.8,
   STREAM_LEN_MIN: 6,     // digits-per-column-stream range (structural). Sets the jitter spread around
@@ -87,6 +87,9 @@ const CFG = {
   // target is so sparse that even one digit per column would overshoot it,
   // and even then this caps how many consecutive columns it may drop.
   MAX_CONSECUTIVE_CULLED_COLUMNS: 1,
+
+  // -- experiment (live) --
+  DRAW_DENSITY: 1.0,     // global per-digit draw probability, checked before any other logic. 1.0 = no-op.
 
   // -- colour (live) --
   COLOR_BG:        [70, 190, 90],    // background (black-sampling) rain
@@ -599,6 +602,8 @@ function drawDigits() {
   rainCtx.font = `${CFG.GLYPH_SIZE * dpr}px monospace`;
 
   for (const d of digits) {
+    if (Math.random() > CFG.DRAW_DENSITY) continue;
+
     const s = sample(d.x, d.y);
     const offMap = s === -1;
 
