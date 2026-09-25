@@ -97,6 +97,14 @@ const CFG = {
   COLOR_COAT_HALO: [120, 165, 220],  // coat, halo bucket — falls off toward blue
   COLOR_OUTLINE:   [255, 255, 255],  // silhouette-crossing digits, forced regardless of region
 
+  // -- state transitions (live — read at the moment a transition/swap
+  // *starts*; changing mid-transition doesn't retroactively alter one
+  // already in flight) --
+  STATE_FADE: 0.6,        // crossfade duration (seconds) for idle/thinking/explaining switches
+  EXPLAIN_SWAP_MIN: 3,    // random interval range (seconds) between explain_a <-> explain_b swaps
+  EXPLAIN_SWAP_MAX: 5,
+  EXPLAIN_FADE: 1.2,      // crossfade duration (seconds) for explain_a <-> explain_b swaps — slower than STATE_FADE
+
   MAX_DPR: 2,            // devicePixelRatio cap (applied on next resize)
 
   // -- figure layout (applied on next resize; call window.resize() to force it) --
@@ -141,8 +149,17 @@ const TYPE_BLACK = 0, TYPE_GREEN = 1, TYPE_COAT = 2;
 // name -> { mapW, mapH, img, typeArr, bucketArr, outlineArr, headHandArr,
 //           nonBlackFraction, displayCanvas, displayCtx }
 const poseData = {};
-let currentPoseName = null;
-const STATE_TO_POSE = { idle: 'idle', thinking: 'thinking', explaining: 'explain_a' };
+let currentPoseName = null;   // the literal pose currently active (sampler/display)
+let currentStateName = null;  // the semantic state ('idle'/'thinking'/'explaining') — distinct
+                               // from currentPoseName because 'explaining' alternates between
+                               // explain_a/explain_b while the state itself doesn't change
+const EXPLAIN_POSES = ['explain_a', 'explain_b'];
+let explainPoseIndex = 0;
+let explainSwapTimer = null;
+
+// In-flight crossfade, or null when idle. { fromPose, toPose, startMs,
+// durationMs, progress } — progress is written each frame by updateTransition().
+let transition = null;
 
 function resize() {
   dpr = Math.min(window.devicePixelRatio || 1, CFG.MAX_DPR);
@@ -152,7 +169,7 @@ function resize() {
   mapCanvas.style.height = rainCanvas.style.height = window.innerHeight + 'px';
   if (mapLoaded) {
     computeLayout();
-    drawMapDisplay();
+    if (transition) updateTransition(); else drawMapDisplay();
     initDigits();
   }
 }
@@ -181,6 +198,24 @@ function computeLayout() {
 function drawMapDisplay() {
   mapCtx.clearRect(0, 0, W, H);
   if (displayCanvas) mapCtx.drawImage(displayCanvas, mX, mY, mW, mH);
+}
+
+// Crossfade variant — draws both poses' display canvases at complementary
+// alpha (from at 1-t, to at t). Called every frame by updateTransition()
+// while a transition is in flight; drawMapDisplay() above is the resting,
+// single-pose steady state used everywhere else.
+function drawMapDisplayBlend(fromCanvas, toCanvas, t) {
+  mapCtx.clearRect(0, 0, W, H);
+  if (fromCanvas) {
+    mapCtx.globalAlpha = 1 - t;
+    mapCtx.drawImage(fromCanvas, mX, mY, mW, mH);
+    mapCtx.globalAlpha = 1;
+  }
+  if (toCanvas) {
+    mapCtx.globalAlpha = t;
+    mapCtx.drawImage(toCanvas, mX, mY, mW, mH);
+    mapCtx.globalAlpha = 1;
+  }
 }
 
 // ── map analysis (runs once per pose at load, and again for the active pose
@@ -456,22 +491,109 @@ window.rebuildMap = function () {
   initDigits();
 };
 
-// Switch the active pose ('idle' | 'thinking' | 'explaining' — 'explaining'
-// currently renders the explain_a pose). Step 1: instant, no crossfade —
-// just repoints the sampler and redraws the static layer.
+// Start (or restart) a crossfade from the current pose to `toPoseName` over
+// `durationSeconds`. Under prefers-reduced-motion, switches instantly
+// instead — no transition object is ever created, so nothing per-frame
+// needs to special-case it.
+function beginTransition(toPoseName, durationSeconds) {
+  if (!poseData[toPoseName]) return;
+
+  if (reduced.matches) {
+    transition = null;
+    applyPose(toPoseName);
+    drawMapDisplay();
+    return;
+  }
+
+  transition = {
+    fromPose: currentPoseName,
+    toPose: toPoseName,
+    startMs: performance.now(),
+    durationMs: Math.max(0, durationSeconds) * 1000,
+    progress: 0,
+  };
+}
+
+// Advance the in-flight transition by elapsed time, redraw the blended
+// static layer, and finalize (applyPose + clear) once it completes. Called
+// once per rendered frame from loop() (and once from resize(), so a resize
+// mid-transition redraws at the correct blend instead of popping to the
+// from-pose). No-op if there's no transition.
+function updateTransition() {
+  if (!transition) return;
+  const elapsed = performance.now() - transition.startMs;
+  const progress = transition.durationMs <= 0 ? 1 : Math.min(1, elapsed / transition.durationMs);
+  transition.progress = progress;
+
+  const fromPose = poseData[transition.fromPose] || null;
+  const toPose = poseData[transition.toPose];
+  drawMapDisplayBlend(fromPose ? fromPose.displayCanvas : null, toPose.displayCanvas, progress);
+
+  if (progress >= 1) {
+    applyPose(transition.toPose);
+    drawMapDisplay();
+    transition = null;
+  }
+}
+
+// ── 'explaining' alternation ────────────────────────────────────────────
+// While the state is 'explaining', keep swapping between explain_a and
+// explain_b at a random interval, each swap using the slower EXPLAIN_FADE
+// crossfade instead of STATE_FADE. Stops as soon as the state changes away
+// from 'explaining' (see setState below) or under reduced-motion.
+function stopExplainAlternation() {
+  if (explainSwapTimer !== null) {
+    clearTimeout(explainSwapTimer);
+    explainSwapTimer = null;
+  }
+}
+
+function scheduleExplainSwap() {
+  stopExplainAlternation();
+  if (reduced.matches) return; // no alternation under reduced motion
+  const min = CFG.EXPLAIN_SWAP_MIN, max = CFG.EXPLAIN_SWAP_MAX;
+  const delaySeconds = min + Math.random() * Math.max(0, max - min);
+  explainSwapTimer = setTimeout(() => {
+    if (currentStateName !== 'explaining') return; // state changed while waiting
+    explainPoseIndex = 1 - explainPoseIndex;
+    beginTransition(EXPLAIN_POSES[explainPoseIndex], CFG.EXPLAIN_FADE);
+    scheduleExplainSwap();
+  }, delaySeconds * 1000);
+}
+
+// Switch state ('idle' | 'thinking' | 'explaining'). Crossfades over
+// CFG.STATE_FADE seconds ('explaining' starts on explain_a and then
+// alternates with explain_b — see scheduleExplainSwap above); instant under
+// prefers-reduced-motion (see beginTransition).
 window.setState = function (state) {
-  const poseName = STATE_TO_POSE[state];
-  if (!poseName) {
+  if (state !== 'idle' && state !== 'thinking' && state !== 'explaining') {
     console.error(`Bytegeist: setState("${state}") — unknown state. Use 'idle', 'thinking', or 'explaining'.`);
     return;
   }
-  if (!poseData[poseName]) {
-    console.error(`Bytegeist: setState("${state}") — pose "${poseName}" is not available (failed to load or dimension mismatch).`);
+  if (!mapLoaded) {
+    console.error(`Bytegeist: setState("${state}") — called before poses finished loading.`);
     return;
   }
-  if (poseName === currentPoseName) return;
-  applyPose(poseName);
-  drawMapDisplay();
+  if (state === currentStateName) return; // already in this state (re-entering 'explaining' keeps its alternation as-is)
+
+  stopExplainAlternation();
+
+  let targetPose;
+  if (state === 'explaining') {
+    explainPoseIndex = 0;
+    targetPose = EXPLAIN_POSES[explainPoseIndex];
+  } else {
+    targetPose = state;
+  }
+  if (!poseData[targetPose]) {
+    console.error(`Bytegeist: setState("${state}") — pose "${targetPose}" is not available (failed to load or dimension mismatch).`);
+    return;
+  }
+
+  currentStateName = state;
+  beginTransition(targetPose, CFG.STATE_FADE);
+
+  if (state === 'explaining') scheduleExplainSwap();
 };
 
 // ── debug (temporary) ────────────────────────────────────────────────────
@@ -570,10 +692,21 @@ window.debugColumns = function (N) {
 // bucket/outline/headHand are true if ANY pixel in the patch has them —
 // so a digit picks up a neighbouring hit rather than staying locked to one
 // permanently-dark native pixel for its whole fall.
-function sample(x, y) {
+//
+// `arrays` optionally overrides which pose's classification to read
+// (typeArr/bucketArr/outlineArr/headHandArr) — used during a transition to
+// sample the from- or to-pose per digit instead of the active pose. Layout
+// (mX/mY/mW/mH/mapW/mapH) is shared across poses since dimensions are
+// validated identical at load, so it's never part of the override.
+function sample(x, y, arrays) {
   const fx = (x - mX) / mW;
   const fy = (y - mY) / mH;
   if (fx < 0 || fx >= 1 || fy < 0 || fy >= 1) return -1;
+
+  const ta = arrays ? arrays.typeArr     : typeArr;
+  const ba = arrays ? arrays.bucketArr   : bucketArr;
+  const oa = arrays ? arrays.outlineArr  : outlineArr;
+  const ha = arrays ? arrays.headHandArr : headHandArr;
 
   const cx = (fx * mapW) | 0;
   const cy = (fy * mapH) | 0;
@@ -581,7 +714,7 @@ function sample(x, y) {
 
   if (radius <= 0) {
     const i = cy * mapW + cx;
-    return typeArr[i] | (bucketArr[i] << 2) | (outlineArr[i] << 3) | (headHandArr[i] << 4);
+    return ta[i] | (ba[i] << 2) | (oa[i] << 3) | (ha[i] << 4);
   }
 
   const x0 = Math.max(0, cx - radius), x1 = Math.min(mapW - 1, cx + radius);
@@ -592,12 +725,12 @@ function sample(x, y) {
     const rowBase = py * mapW;
     for (let px = x0; px <= x1; px++) {
       const i = rowBase + px;
-      const t = typeArr[i];
+      const t = ta[i];
       if (t === TYPE_BLACK) continue;
       if (t === TYPE_GREEN) greenCount++; else coatCount++;
-      if (bucketArr[i]) bodyAny = 1;
-      if (outlineArr[i]) outlineAny = 1;
-      if (headHandArr[i]) headHandAny = 1;
+      if (ba[i]) bodyAny = 1;
+      if (oa[i]) outlineAny = 1;
+      if (ha[i]) headHandAny = 1;
     }
   }
 
@@ -684,10 +817,20 @@ const reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
 function drawDigits() {
   rainCtx.font = `${CFG.GLYPH_SIZE * dpr}px monospace`;
 
+  // Mid-transition: each digit this frame independently samples the target
+  // pose with probability equal to transition progress, the source pose
+  // otherwise — the figure dissolves into its new shape through the rain,
+  // rather than every digit flipping over at once.
+  const t = transition;
+  const fromArrays = t ? poseData[t.fromPose] || null : null;
+  const toArrays   = t ? poseData[t.toPose] : null;
+
   for (const d of digits) {
     if (Math.random() > CFG.DRAW_DENSITY) continue;
 
-    const s = sample(d.x, d.y);
+    const s = t
+      ? sample(d.x, d.y, (Math.random() < t.progress ? toArrays : fromArrays) || toArrays)
+      : sample(d.x, d.y);
     const offMap = s === -1;
 
     // Outside the letterboxed map rect entirely (e.g. above/below the
@@ -741,6 +884,8 @@ function advanceDigits() {
 function loop() {
   if (reduced.matches) return;
 
+  updateTransition();
+
   // Fade existing trails toward transparent (destination-out) instead of
   // painting black over them — the map canvas underneath never darkens.
   rainCtx.globalCompositeOperation = 'destination-out';
@@ -759,8 +904,19 @@ function renderStatic() {
 }
 
 reduced.addEventListener('change', () => {
-  if (!reduced.matches) requestAnimationFrame(loop);
-  else renderStatic();
+  if (!reduced.matches) {
+    requestAnimationFrame(loop);
+  } else {
+    // Snap any in-flight crossfade to its end and stop alternating instead
+    // of leaving a half-blended map frozen once the loop stops driving it.
+    if (transition) {
+      applyPose(transition.toPose);
+      transition = null;
+    }
+    stopExplainAlternation();
+    drawMapDisplay();
+    renderStatic();
+  }
 });
 
 // ── boot ──────────────────────────────────────────────────────────────────
@@ -808,6 +964,7 @@ Promise.all(POSE_NAMES.map(loadPoseImage)).then((results) => {
 
   mapLoaded = true;
   applyPose('idle');
+  currentStateName = 'idle';
   computeLayout();
   drawMapDisplay();
   initDigits();
@@ -816,7 +973,7 @@ Promise.all(POSE_NAMES.map(loadPoseImage)).then((results) => {
   else requestAnimationFrame(loop);
 });
 
-// ── temporary test controls (Step 1 only — instant switching, no crossfade) ─
+// ── temporary test controls ──────────────────────────────────────────────
 // Desktop: 1/2/3 keys switch idle/thinking/explaining directly.
 window.addEventListener('keydown', (e) => {
   if (e.key === '1') window.setState('idle');
