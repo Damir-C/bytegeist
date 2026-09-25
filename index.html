@@ -16,7 +16,6 @@ html,body{width:100%;height:100%;background:#000;overflow:hidden}
 <body>
 <canvas id="mapCanvas"></canvas>
 <canvas id="rainCanvas"></canvas>
-<script src="map.js"></script>
 <script>
 // ── config ──────────────────────────────────────────────────────────────
 // Every tunable lives here and is read as CFG.X at the point of use, never
@@ -117,23 +116,33 @@ const rainCanvas = document.getElementById('rainCanvas');
 const mapCtx  = mapCanvas.getContext('2d');
 const rainCtx = rainCanvas.getContext('2d');
 
-// offscreen analysis buffer for the source map (never drawn to screen)
+// offscreen analysis buffer for the source map, reused across pose loads
+// (never drawn to screen — each pose's own displayCanvas below is)
 const analysisCanvas = document.createElement('canvas');
 const analysisCtx    = analysisCanvas.getContext('2d');
-// offscreen canvas holding the alpha-adjusted display version of the map
-const displayCanvas = document.createElement('canvas');
-const displayCtx    = displayCanvas.getContext('2d');
 
 let dpr = Math.min(window.devicePixelRatio || 1, CFG.MAX_DPR);
 let W, H;
 let mX, mY, mW, mH; // letterboxed figure region on screen
 
 let mapLoaded = false;
-let mapW = 0, mapH = 0; // native map pixel dimensions
-let typeArr, bucketArr, outlineArr, headHandArr; // per-pixel classification, length mapW*mapH
+let mapW = 0, mapH = 0; // native map pixel dimensions, of the CURRENT pose
+let typeArr, bucketArr, outlineArr, headHandArr; // current pose's per-pixel classification, length mapW*mapH
 let nonBlackFraction = 0;
+// offscreen canvas holding the current pose's alpha-adjusted display image
+let displayCanvas = null, displayCtx = null;
 
 const TYPE_BLACK = 0, TYPE_GREEN = 1, TYPE_COAT = 2;
+
+// ── poses ─────────────────────────────────────────────────────────────────
+// Each pose is its own PNG under poses/, classified and built independently
+// (own typeArr/bucketArr/outlineArr/headHandArr/displayCanvas — the head/hand
+// mask etc. are derived per pose, never shared or blended across poses).
+// name -> { mapW, mapH, img, typeArr, bucketArr, outlineArr, headHandArr,
+//           nonBlackFraction, displayCanvas, displayCtx }
+const poseData = {};
+let currentPoseName = null;
+const STATE_TO_POSE = { idle: 'idle', thinking: 'thinking', explaining: 'explain_a' };
 
 function resize() {
   dpr = Math.min(window.devicePixelRatio || 1, CFG.MAX_DPR);
@@ -171,18 +180,19 @@ function computeLayout() {
 // cannot accumulate brightness against the rain canvas's fade.
 function drawMapDisplay() {
   mapCtx.clearRect(0, 0, W, H);
-  mapCtx.drawImage(displayCanvas, mX, mY, mW, mH);
+  if (displayCanvas) mapCtx.drawImage(displayCanvas, mX, mY, mW, mH);
 }
 
-// ── map analysis (runs once at load, and again if rebuildMap() is called) ─
+// ── map analysis (runs once per pose at load, and again for the active pose
+// if rebuildMap() is called) — pure function of imgData/CFG, no module state.
 function classifyMap(imgData) {
   const w = imgData.width, h = imgData.height;
   const n = w * h;
   const data = imgData.data;
 
-  typeArr     = new Uint8Array(n);
-  bucketArr   = new Uint8Array(n);
-  headHandArr = new Uint8Array(n);
+  const typeArr     = new Uint8Array(n);
+  const bucketArr   = new Uint8Array(n);
+  const headHandArr = new Uint8Array(n);
   // outlineArr is built separately by computeOutline() once typeArr is ready
 
   let nonBlack = 0;
@@ -223,7 +233,7 @@ function classifyMap(imgData) {
       if (y > greenMaxY) greenMaxY = y;
     }
   }
-  nonBlackFraction = nonBlack / n;
+  const nonBlackFraction = nonBlack / n;
 
   // pass 2 — head/hand zone. If the map has no green at all, greenMinY/MaxY
   // stay at their Infinity sentinels, the threshold below evaluates to NaN,
@@ -239,7 +249,8 @@ function classifyMap(imgData) {
     }
   }
 
-  outlineArr = computeOutline(w, h);
+  const outlineArr = computeOutline(typeArr, w, h);
+  return { mapW: w, mapH: h, typeArr, bucketArr, outlineArr, headHandArr, nonBlackFraction };
 }
 
 // Dilate a binary mask by `radius` map-px using a square structuring
@@ -283,7 +294,7 @@ function dilateMask(src, w, h, radius) {
 //     interior hole, not background.
 //  4. The outline is blob pixels that border true exterior — never interior
 //     holes — so it traces the figure's outer silhouette only.
-function computeOutline(w, h) {
+function computeOutline(typeArr, w, h) {
   const n = w * h;
   const nonBlack = new Uint8Array(n);
   for (let i = 0; i < n; i++) nonBlack[i] = typeArr[i] !== TYPE_BLACK ? 1 : 0;
@@ -360,11 +371,13 @@ function computeOutline(w, h) {
 
 // Build the alpha-adjusted display image from the same classification:
 // body-bucket pixels solid, halo-bucket pixels dim, black fully transparent.
-function buildMapDisplay(imgData) {
+// Pure w.r.t. module state — writes into the given canvas/ctx.
+function buildMapDisplay(imgData, classification, targetCanvas, targetCtx) {
   const w = imgData.width, h = imgData.height;
   const n = w * h;
   const out = new ImageData(w, h);
   const src = imgData.data, dst = out.data;
+  const { typeArr, bucketArr } = classification;
 
   for (let i = 0; i < n; i++) {
     const o = i * 4;
@@ -373,22 +386,92 @@ function buildMapDisplay(imgData) {
       ? 0
       : Math.round(255 * (bucketArr[i] ? CFG.IMG_ALPHA_BODY : CFG.IMG_ALPHA_HALO));
   }
-  displayCanvas.width  = w;
-  displayCanvas.height = h;
-  displayCtx.putImageData(out, 0, 0);
+  targetCanvas.width  = w;
+  targetCanvas.height = h;
+  targetCtx.putImageData(out, 0, 0);
 }
 
-// Re-run classification + display build + layout + density from current
-// CFG values, without a reload. Needed for the analysis-time constants
-// (see the comment block at the top of CFG).
+// Classify + build the display canvas for one pose's already-loaded <img>,
+// and store the result in poseData[name]. analysisCanvas/analysisCtx are a
+// shared scratch buffer — safe to reuse across poses since each call runs
+// to completion synchronously (no await) before the next one starts.
+function registerPose(name, img, w, h) {
+  analysisCanvas.width  = w;
+  analysisCanvas.height = h;
+  analysisCtx.clearRect(0, 0, w, h);
+  analysisCtx.drawImage(img, 0, 0);
+  const imgData = analysisCtx.getImageData(0, 0, w, h);
+
+  const classification = classifyMap(imgData);
+  const dCanvas = document.createElement('canvas');
+  const dCtx    = dCanvas.getContext('2d');
+  buildMapDisplay(imgData, classification, dCanvas, dCtx);
+
+  poseData[name] = {
+    mapW: w, mapH: h, img,
+    typeArr: classification.typeArr,
+    bucketArr: classification.bucketArr,
+    outlineArr: classification.outlineArr,
+    headHandArr: classification.headHandArr,
+    nonBlackFraction: classification.nonBlackFraction,
+    displayCanvas: dCanvas, displayCtx: dCtx,
+  };
+}
+
+// Point the module-level "active pose" variables (read by sample() every
+// frame, and by drawMapDisplay()) at a already-registered pose. Instant —
+// no crossfade — just swaps which arrays/canvas are read.
+function applyPose(name) {
+  const p = poseData[name];
+  if (!p) return;
+  mapW = p.mapW; mapH = p.mapH;
+  typeArr = p.typeArr; bucketArr = p.bucketArr;
+  outlineArr = p.outlineArr; headHandArr = p.headHandArr;
+  nonBlackFraction = p.nonBlackFraction;
+  displayCanvas = p.displayCanvas; displayCtx = p.displayCtx;
+  currentPoseName = name;
+}
+
+// Re-run classification + display build + layout + density for the
+// CURRENTLY ACTIVE pose only, from current CFG values, without a reload.
+// Needed for the analysis-time constants (see the comment block at the top
+// of CFG). Other poses keep their existing classification until switched to
+// and rebuilt themselves.
 window.rebuildMap = function () {
-  if (!mapLoaded) return;
-  const imgData = analysisCtx.getImageData(0, 0, mapW, mapH);
-  classifyMap(imgData);
-  buildMapDisplay(imgData);
+  if (!mapLoaded || !currentPoseName) return;
+  const p = poseData[currentPoseName];
+  analysisCanvas.width  = p.mapW;
+  analysisCanvas.height = p.mapH;
+  analysisCtx.clearRect(0, 0, p.mapW, p.mapH);
+  analysisCtx.drawImage(p.img, 0, 0);
+  const imgData = analysisCtx.getImageData(0, 0, p.mapW, p.mapH);
+
+  const classification = classifyMap(imgData);
+  buildMapDisplay(imgData, classification, p.displayCanvas, p.displayCtx);
+  Object.assign(p, classification);
+
+  applyPose(currentPoseName);
   computeLayout();
   drawMapDisplay();
   initDigits();
+};
+
+// Switch the active pose ('idle' | 'thinking' | 'explaining' — 'explaining'
+// currently renders the explain_a pose). Step 1: instant, no crossfade —
+// just repoints the sampler and redraws the static layer.
+window.setState = function (state) {
+  const poseName = STATE_TO_POSE[state];
+  if (!poseName) {
+    console.error(`Bytegeist: setState("${state}") — unknown state. Use 'idle', 'thinking', or 'explaining'.`);
+    return;
+  }
+  if (!poseData[poseName]) {
+    console.error(`Bytegeist: setState("${state}") — pose "${poseName}" is not available (failed to load or dimension mismatch).`);
+    return;
+  }
+  if (poseName === currentPoseName) return;
+  applyPose(poseName);
+  drawMapDisplay();
 };
 
 // ── debug (temporary) ────────────────────────────────────────────────────
@@ -681,31 +764,74 @@ reduced.addEventListener('change', () => {
 });
 
 // ── boot ──────────────────────────────────────────────────────────────────
-const img = new Image();
-img.onload = function () {
-  mapW = img.naturalWidth;
-  mapH = img.naturalHeight;
+// Load all four pose PNGs (same-origin under GitHub Pages, so canvas reads
+// off them are unrestricted). All poses must share identical pixel
+// dimensions — mismatches are logged and that pose is skipped rather than
+// registered, so a broken pose file can't silently misalign the figure.
+function loadPoseImage(name) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve({ name, img, w: img.naturalWidth, h: img.naturalHeight, ok: true });
+    img.onerror = () => {
+      console.error(`Bytegeist: failed to load pose image poses/${name}.png`);
+      resolve({ name, ok: false });
+    };
+    img.src = `poses/${name}.png`;
+  });
+}
 
-  analysisCanvas.width  = mapW;
-  analysisCanvas.height = mapH;
-  analysisCtx.drawImage(img, 0, 0);
-  const imgData = analysisCtx.getImageData(0, 0, mapW, mapH);
+const POSE_NAMES = ['idle', 'thinking', 'explain_a', 'explain_b'];
 
-  classifyMap(imgData);
-  buildMapDisplay(imgData);
+Promise.all(POSE_NAMES.map(loadPoseImage)).then((results) => {
+  // 'idle' is the reference dimension when available (it's the default
+  // pose); otherwise fall back to the first pose that loaded successfully.
+  const idleResult = results.find(r => r.name === 'idle' && r.ok);
+  const ref = idleResult || results.find(r => r.ok);
+  if (!ref) {
+    console.error('Bytegeist: no pose images could be loaded — nothing to render.');
+    return;
+  }
+
+  for (const r of results) {
+    if (!r.ok) continue;
+    if (r.w !== ref.w || r.h !== ref.h) {
+      console.error(`Bytegeist: pose "${r.name}" (poses/${r.name}.png) is ${r.w}x${r.h}px, expected ${ref.w}x${ref.h}px to match the other poses — skipping.`);
+      continue;
+    }
+    registerPose(r.name, r.img, r.w, r.h);
+  }
+
+  if (!poseData.idle) {
+    console.error('Bytegeist: idle pose failed to load or was skipped — nothing to render.');
+    return;
+  }
 
   mapLoaded = true;
+  applyPose('idle');
   computeLayout();
   drawMapDisplay();
   initDigits();
 
   if (reduced.matches) renderStatic();
   else requestAnimationFrame(loop);
-};
-img.onerror = function () {
-  console.error('Bytegeist: failed to load map image');
-};
-img.src = 'data:image/png;base64,' + MAP_B64;
+});
+
+// ── temporary test controls (Step 1 only — instant switching, no crossfade) ─
+// Desktop: 1/2/3 keys switch idle/thinking/explaining directly.
+window.addEventListener('keydown', (e) => {
+  if (e.key === '1') window.setState('idle');
+  else if (e.key === '2') window.setState('thinking');
+  else if (e.key === '3') window.setState('explaining');
+});
+
+// Phone: tapping the screen cycles idle -> thinking -> explaining -> idle...
+const STATE_CYCLE = ['idle', 'thinking', 'explaining'];
+let stateCycleIndex = 0;
+window.addEventListener('pointerdown', (e) => {
+  if (e.pointerType !== 'touch') return;
+  stateCycleIndex = (stateCycleIndex + 1) % STATE_CYCLE.length;
+  window.setState(STATE_CYCLE[stateCycleIndex]);
+});
 
 // ── wake lock ────────────────────────────────────────────────────────────
 // Keep the screen on while the page is open. Released automatically by the
