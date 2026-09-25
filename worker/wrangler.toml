@@ -1,0 +1,12 @@
+name = "bytegeist-anthropic-proxy"
+main = "src/index.js"
+compatibility_date = "2026-09-25"
+
+[vars]
+# Not secret — just the CORS allowlist and non-sensitive request defaults.
+ALLOWED_ORIGIN = "https://damir-c.github.io"
+ANTHROPIC_MODEL = "claude-sonnet-5"
+ANTHROPIC_MAX_TOKENS = "1024"
+
+# ANTHROPIC_API_KEY is set separately as a secret — never put it here.
+# See worker/README.md.
